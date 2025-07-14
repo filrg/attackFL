@@ -134,6 +134,7 @@ def train_HAR(model, epoch, lr, momentum, clip_grad_norm, trainloader):
 if __name__ == "__main__":
     src.Log.print_with_color("[>>>] Client sending registration message to server...", "red")
     data = {"action": "REGISTER", "client_id": client_id, "message": "Hello from Client!", "attack": args.attack}
+    print("Client ID:", client_id)
     client = RpcClient(client_id, address, username, password, train_on_device, device)
     if args.attack:
         client.set_attack_config(args.attack_mode, args.attack_round, args.attack_args)

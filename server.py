@@ -6,6 +6,7 @@ import sys
 import yaml
 import numpy as np
 import torch
+import torch.nn.functional as F
 import requests
 import random
 import copy
@@ -21,8 +22,10 @@ import src.Model
 
 from src.Utils import calculate_md, train_gmm_model, verify_gradient
 from src.Utils import krum, get_weight_vector
-from src.Utils import byzantine_tolerance_aggregation, median_aggregation, trimmed_mean_aggregation 
+from src.Utils import state_dict_to_vector, byzantine_tolerance_aggregation, median_aggregation, trimmed_mean_aggregation 
 from src.Utils import cosine, DBSCAN_phase2
+from src.Utils import flatten_state_dict, fltracer_detect_anomalies
+from src.Utils import quantize_vector, l2_norm, dequantize, cosine_distance
 from src.Model import ICUData
 
 from client import*
@@ -30,7 +33,7 @@ from torch.utils.data import Subset
 
 
 
-parser = argparse.ArgumentParser(description="Split learning framework with controller.")
+parser = argparse.ArgumentParser(description="Federated learning framework with controller.")
 
 parser.add_argument('--device', type=str, required=False, help='Device of server')
 
@@ -127,8 +130,9 @@ class Server:
 
         # detection algorithms
         self.previous_hyper = None
-        self.cosine_search = 10
+        self.cosine_search = 5
         self.list_embeddings = [deque(maxlen=self.cosine_search) for _ in range(self.total_clients)]
+  
 
         if server_mode == "hyper":
             if not self.net and not self.hnet:
@@ -291,8 +295,9 @@ class Server:
             elif server_mode == "hyper":
                 src.Log.print_with_color(f"Start training hyper model!", "yellow")
                 if hyper_detection_enable:
-                    self.previous_hyper = self.hnet.state_dict()
+                    self.previous_hyper = copy.deepcopy(self.hnet.state_dict())
                 self.train_hyper()
+                
             elif server_mode == "trimmed_mean":
                 src.Log.print_with_color(f"Using  trimmed mean aggregation!", "yellow")
                 self.final_state_dict = trimmed_mean_aggregation(
@@ -300,9 +305,50 @@ class Server:
                 )
             elif server_mode == "shieldfl":
                 src.Log.print_with_color(f"Using ShieldFL aggregation!", "yellow")
-                self.final_state_dict = byzantine_tolerance_aggregation(
-                    [model['weight'] for model in self.all_model_parameters], threshold=0.9
-                )
+                print(f"Number of model weight = {len(self.all_model_parameters)}")
+            
+                client_vectors = []
+                for entry in self.all_model_parameters:
+                    vec = state_dict_to_vector(entry['weight'])
+                    vec = vec / (vec.norm() + 1e-8)  # normalize
+                    client_vectors.append(vec)
+            
+                # Tham chiếu trung bình
+                ref = sum(client_vectors) / len(client_vectors)
+            
+                # Tính độ tương đồng cosine với vector ref
+                cosine_sims = torch.tensor([
+                    F.cosine_similarity(vec.view(1, -1), ref.view(1, -1)).item()
+                    for vec in client_vectors
+                ])
+            
+                # Độ lệch là (1 - cosine_similarity)
+                deviation = 1 - cosine_sims
+            
+                # Trọng số ngược lệch → client càng gần ref thì weight càng lớn
+                weights = 1 / (deviation + 1e-6)  # thêm epsilon tránh chia 0
+                weights = weights / weights.sum()  # chuẩn hóa tổng = 1
+            
+                # Weighted aggregation
+                state_dict_list = [entry['weight'] for entry in self.all_model_parameters]
+                avg_state = copy.deepcopy(state_dict_list[0])  # deepcopy để giữ nguyên
+            
+                for key in avg_state.keys():
+                    if torch.is_floating_point(avg_state[key]):
+                        avg_state[key] = sum(
+                            state_dict_list[i][key].float() * weights[i]
+                            for i in range(len(state_dict_list))
+                        )
+                    elif avg_state[key].dtype in [torch.long, torch.int, torch.int64]:
+                        avg_state[key] = sum(
+                            state_dict_list[i][key] * weights[i]
+                            for i in range(len(state_dict_list))
+                        ).round().to(torch.long)  # làm tròn về long
+                    else:
+                        continue  # bỏ qua kiểu khác
+
+                self.final_state_dict = avg_state
+                
             elif server_mode == "gmm":
                 src.Log.print_with_color(f"Using GMM-based gradient filtering!", "yellow")
                 
@@ -346,37 +392,148 @@ class Server:
                 self.final_state_dict = median_aggregation(
                     [model['weight'] for model in self.all_model_parameters]
                 )
+            # elif server_mode == "fltracer":
+            #     src.Log.print_with_color(f"Using FLTracer aggregation!", "yellow")
+            #     print(f"Number of model weight = {len(self.all_model_parameters)}")
+            
+            #     state_dict_list = [entry['weight'] for entry in self.all_model_parameters]
+            #     client_sizes = [entry['size'] for entry in self.all_model_parameters]
+            
+            #     flat_weights = [flatten_state_dict(sd) for sd in state_dict_list]
+            #     weight_matrix = np.stack([w.numpy() for w in flat_weights])
+            
+            #     anomaly_indices = fltracer_detect_anomalies(weight_matrix)
+            #     print(f"Anomaly indices = {anomaly_indices}")
+            
+            #     # Lọc ra những client không bị nghi ngờ
+            #     benign_entries = [
+            #         entry for i, entry in enumerate(self.all_model_parameters)
+            #         if i not in anomaly_indices
+            #     ]
+            #     # benign_entries = self.all_model_parameters
+            
+            #     benign_state_dicts = [entry['weight'] for entry in benign_entries]
+            #     benign_sizes = [entry['size'] for entry in benign_entries]
+            #     total_size = sum(benign_sizes)
+                
+            #     global_model_state_dict = copy.deepcopy(benign_state_dicts[0])  # cần deepcopy để không làm thay đổi bản gốc
+            
+            #     for key in global_model_state_dict.keys():
+            #         if torch.is_floating_point(global_model_state_dict[key]):
+            #             global_model_state_dict[key] = sum(
+            #                 benign_state_dicts[i][key] * benign_sizes[i]
+            #                 for i in range(len(benign_state_dicts))
+            #             ) / total_size
+            #         elif global_model_state_dict[key].dtype in [torch.long, torch.int, torch.int64]:
+            #             global_model_state_dict[key] = sum(
+            #                 benign_state_dicts[i][key] * benign_sizes[i]
+            #                 for i in range(len(benign_state_dicts))
+            #             ) // total_size
+            #         else:
+            #             continue  # Bỏ qua kiểu dữ liệu không hỗ trợ
+            
+            #     self.final_state_dict = global_model_state_dict
+            elif server_mode == "scionfl":
+                src.Log.print_with_color(f"Using ScionFL aggregation!", "yellow")
+                print(f"Number of model weight = {len(self.all_model_parameters)}")
+            
+                state_dict_list = [entry['weight'] for entry in self.all_model_parameters]
+                client_sizes = [entry['size'] for entry in self.all_model_parameters]
+            
+                flat_vectors = [flatten_state_dict(sd) for sd in state_dict_list]
+                quantized_updates = [quantize_vector(vec) for vec in flat_vectors]
+            
+                # Step 1: L2 norm clipping
+                l2_values = [l2_norm(*q) for q in quantized_updates]
+                l2_avg = np.mean(l2_values)
+                MU_THRESHOLD = 3
+                TOPK_RATIO = 0.5
+            
+                clipped_updates = []
+                for (sigma, smin, smax), l2 in zip(quantized_updates, l2_values):
+                    if l2 > MU_THRESHOLD * l2_avg:
+                        factor = (MU_THRESHOLD * l2_avg) / l2
+                        smin *= factor
+                        smax *= factor
+                    clipped_updates.append((sigma, smin, smax))
+            
+                # Step 2: Dequantize + tính vector trung bình
+                agg_vector = sum(dequantize(*q) for q in clipped_updates) / len(clipped_updates)
+            
+                # Step 3: Cosine filtering
+                cosine_scores = [cosine_distance(dequantize(*q), agg_vector) for q in clipped_updates]
+                threshold = sorted(cosine_scores, reverse=True)[int(TOPK_RATIO * len(cosine_scores))]
+                benign_indices = [i for i, s in enumerate(cosine_scores) if s > threshold]
+            
+                print(f"Benign indices = {benign_indices}")
+            
+                # Step 4: Lấy state_dict và size của các client hợp lệ
+                benign_state_dicts = [state_dict_list[i] for i in benign_indices]
+                benign_sizes = [client_sizes[i] for i in benign_indices]
+                total_size = sum(benign_sizes)
+            
+                # Step 5: Tổng hợp theo kiểu FedAvg (có trọng số)
+                new_sd = copy.deepcopy(benign_state_dicts[0])  # sao chép state_dict đầu tiên
+            
+                for key in new_sd.keys():
+                    if torch.is_floating_point(new_sd[key]):
+                        new_sd[key] = sum(
+                            benign_state_dicts[i][key].float() * benign_sizes[i]
+                            for i in range(len(benign_state_dicts))
+                        ) / total_size
+                    elif new_sd[key].dtype in [torch.long, torch.int, torch.int64]:
+                        new_sd[key] = sum(
+                            benign_state_dicts[i][key] * benign_sizes[i]
+                            for i in range(len(benign_state_dicts))
+                        ).round().to(torch.long)
+                    else:
+                        continue  # bỏ qua kiểu dữ liệu khác
+            
+                self.final_state_dict = new_sd
+            else:
+                raise ValueError(f"Server mode '{server_mode}' is not valid.")
 
         if hyper_detection_enable:
+        
             to_remove = []
             for i in self.selected_client:
+                # _, current_embedding = self.hnet(torch.tensor([i], dtype=torch.long).to(device))
+                # current_embedding = current_embedding.reshape(-1).tolist()
+                # current_embedding = np.array(current_embedding)
+                
                 _, current_embedding = self.hnet(torch.tensor([i], dtype=torch.long).to(device))
-                current_embedding = current_embedding.reshape(-1).tolist()
-                current_embedding = np.array(current_embedding)
-
+                current_embedding = np.array(current_embedding.detach().cpu())
+                current_embedding = current_embedding.reshape(1, -1)
                 # convert client indices to client id
                 # client_id = self.list_clients[i]
 
-                previous_embeddings = list(self.list_embeddings[i])
-                if cosine(previous_embeddings, current_embedding):
-                    to_remove.append(i)
+                #previous_embeddings = list(self.list_embeddings[i])
+                previous_embeddings = np.vstack(self.list_embeddings[i]) if self.list_embeddings[i] else np.empty((0, current_embedding.shape[1]))
+                
+                if self.num_round - self.round + 1 >= 18:
+                    if cosine(previous_embeddings, current_embedding):
+                        to_remove.append(i)
 
                 self.list_embeddings[i].append(current_embedding)
+               
+                embeddings_to_save = [list(dq) for dq in self.list_embeddings]
 
+                # Lưu với object dtype để hỗ trợ list không đồng đều
+                np.save("all_embeddings.npy", np.array(embeddings_to_save, dtype=object))
+                
+            if self.num_round - self.round + 1 >= 18:
+                  
             # embedding round n and n-1
-            outliers = DBSCAN_phase2([sublist[-2] for sublist in self.list_embeddings],
-                                     [sublist[-1] for sublist in self.list_embeddings],
-                                     self.selected_client, n_components=DBSCAN_n_components, eps=DBSCAN_eps, min_samples=DBSCAN_min_samples)
-            print("Outliers từ DBSCAN:", outliers)
-
-            to_remove = list(set(to_remove) & set(outliers))
-
-            if to_remove:
-                for node_id in to_remove:
-                    print(f"Removing anomaly {node_id}, rolling back")
-                    self.selected_client.remove(node_id)
-
-                self.hnet.load_state_dict(self.previous_hyper)
+                outliers = DBSCAN_phase2([sublist[-2] for sublist in self.list_embeddings],
+                                        [sublist[-1] for sublist in self.list_embeddings],
+                                        self.selected_client, n_components=DBSCAN_n_components, eps=DBSCAN_eps, min_samples=DBSCAN_min_samples)
+                print("Outliers từ DBSCAN:", outliers)
+                to_remove = list(set(to_remove) & set(outliers))
+                if to_remove:
+                    for node_id in to_remove:
+                        print(f"Removing anomaly {node_id}, rolling back")
+                        self.selected_client.remove(node_id)
+                    self.hnet.load_state_dict(self.previous_hyper)
 
         # Server validation
         if validation and self.round_result:
@@ -425,6 +582,8 @@ class Server:
                     filepath = f'{model_name}.pth'
                     if os.path.exists(filepath):
                         state_dict = torch.load(filepath)
+                else:
+                    state_dict = self.final_state_dict
 
             for i in self.selected_client:
                 if server_mode == "hyper":
@@ -495,7 +654,8 @@ class Server:
             hnet_grads = torch.autograd.grad(
                 outputs=list(weights.values()),
                 inputs=self.hnet.parameters(),
-                grad_outputs=list(delta_theta.values())
+                grad_outputs=list(delta_theta.values()),
+                allow_unused=True
             )
 
             # Update the hypernetwork parameters
@@ -513,7 +673,7 @@ class Server:
         src.Log.print_with_color(f"Update new clients' weight", "yellow")
         for i in range(len(self.all_model_parameters)):
             c = self.list_clients.index(str(self.all_model_parameters[i]["client_id"]))
-            print(f"Get client on index {c}")
+            print(f"Get client on index {c}: client id {self.all_model_parameters[i]['client_id']}")
             model_dict, _ = self.hnet(torch.tensor([c]).to(device))
             self.all_model_parameters[i]["weight"] = model_dict
 
@@ -548,7 +708,7 @@ class Server:
         else:
             g_0 = self.model.state_dict()
             
-        train_on_device(self.model, epoch, lr, momentum, clip_grad_norm,self.root_loader)
+        train_on_device(self.model, data_name, epoch, lr, momentum, clip_grad_norm, self.root_loader)
         g0 = self.model.state_dict()
         g0_delta = self.subtract_state_dict(g0, g_0)
         norm_g0 = torch.sqrt(sum(torch.norm(p) ** 2 for p in g0_delta.values()))
@@ -637,8 +797,8 @@ class Server:
         return avg_weights
 
     def load_new_hyper(self):
-        # self.hnet = src.Model.HyperNetwork(self.net, self.total_clients, 3, 100, False, 1).to(device)
-        self.hnet = src.Model.CNNHyper(self.total_clients, 10 , 100, 3).to(device)
+        self.hnet = src.Model.HyperNetwork(self.net, self.total_clients, 8, 100, False, 2).to(device)
+        #self.hnet = src.Model.CNNHyper(self.total_clients, 10 , 100, 3).to(device)
         
 def delete_old_queues():
     url = f'http://{address}:15672/api/queues'

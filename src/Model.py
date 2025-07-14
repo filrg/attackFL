@@ -249,7 +249,7 @@ class TransformerModel(nn.Module):
 ##### HyperNetwork #####
 
 class HyperNetwork(nn.Module):
-    def __init__(self, target_model, n_nodes, embedding_dim, hidden_dim=100, spec_norm=False, n_hidden=1):
+    def __init__(self, target_model, n_nodes, embedding_dim, hidden_dim=100, spec_norm=False, n_hidden=2):
         super(HyperNetwork, self).__init__()
         self.target_model = target_model
         self.embeddings = nn.Embedding(num_embeddings=n_nodes, embedding_dim=embedding_dim)

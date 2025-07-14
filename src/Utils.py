@@ -7,6 +7,7 @@ from sklearn.mixture import GaussianMixture
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.cluster import DBSCAN
 from sklearn.decomposition import PCA
+from scipy.stats import median_abs_deviation as MAD
 
 
 class ICUData(Dataset):
@@ -48,12 +49,11 @@ def compute_distance(state_dict1, state_dict2, p=2):
     return total_distance
 
 
-def create_random_base_model(state_dict, perturbation=0.1):
+def create_random_base_model(state_dict, perturbation=1e6):
     base_model = copy.deepcopy(state_dict)
     for param in base_model.keys():
         if base_model[param].dtype != torch.long:
             base_model[param] += torch.randn_like(base_model[param]) * perturbation
-
     return base_model
 
 
@@ -221,6 +221,9 @@ def cosine_similarity(state_dict1, state_dict2):
     cos = torch.nn.CosineSimilarity(dim=0)
     return cos(vector1, vector2)
 
+# shieldFL
+def state_dict_to_vector(state_dict):
+    return torch.cat([param.flatten() for param in state_dict.values()])
 
 def byzantine_tolerance_aggregation(models, threshold=0.9):
     """Lọc mô hình độc hại dựa trên độ tương đồng cosine."""
@@ -298,7 +301,6 @@ def trimmed_mean_aggregation(models, trim_ratio=0.1):
 
     return result
 
-
 def calculate_md(gradient, mean_vector, covariance_matrix):
     """Tính Mahalanobis Distance giữa gradient và phân phối."""
     delta = gradient - mean_vector
@@ -354,12 +356,42 @@ def median_aggregation(models):
         result[key] = torch.median(stacked, dim=0).values
     return result
 
+# fltracer
+def flatten_state_dict(state_dict):
+    return torch.cat([v.view(-1).float().cpu() for v in state_dict.values()])
+
+def fltracer_detect_anomalies(weight_matrix, threshold=2.5):
+    pca = PCA(n_components=1)
+    z = pca.fit_transform(weight_matrix).squeeze()
+    mad = MAD(z)
+    median = np.median(z)
+    scores = np.abs(z - median) / (1.4826 * mad + 1e-6)
+    return np.where(scores > threshold)[0]
+
+# scionfl
+def quantize_vector(vec):
+    smin, smax = vec.min(), vec.max()
+    probs = (vec - smin) / (smax - smin + 1e-6)
+    sigma = torch.bernoulli(probs)
+    return sigma, smin.item(), smax.item()
+
+def l2_norm(sigma, smin, smax):
+    count_1 = sigma.sum().item()
+    count_0 = len(sigma) - count_1
+    return np.sqrt(count_0 * smin**2 + count_1 * smax**2)
+
+def dequantize(sigma, smin, smax):
+    return smin + sigma * (smax - smin)
+
+def cosine_distance(vec1, vec2):
+    return 1 - torch.nn.functional.cosine_similarity(vec1.unsqueeze(0), vec2.unsqueeze(0)).item()
+
+# hyper detection
 
 def cosine(previous_embeddings, current_embedding):
     # old embedding
     embeddings_normal_history = np.array(previous_embeddings)
     E_norm_nor = embeddings_normal_history / np.linalg.norm(embeddings_normal_history, axis=1, keepdims=True)
-
     # new embedding
     em_test = current_embedding / np.linalg.norm(current_embedding, axis=1, keepdims=True)
     E_norm_mean = np.mean(E_norm_nor, axis=0)
@@ -374,7 +406,7 @@ def cosine(previous_embeddings, current_embedding):
     mu = np.mean(cosine_history)
     sigma = np.std(cosine_history)
     sigma = max(sigma, 1e-6)
-
+    
     k = 2
     threshold = mu - k * sigma
     anomalies = cosine_similarity < threshold
@@ -384,11 +416,11 @@ def cosine(previous_embeddings, current_embedding):
     return anomalies
 
 
-def DBSCAN_phase2(embeddings_before, embeddings_after, selected_clients, n_components=3, eps=0.015, min_samples=3):
+def DBSCAN_phase2(embeddings_before, embeddings_after, selected_clients, n_components=3, eps=0.008, min_samples=3):
     embeddings_ = np.array([embeddings_after[client] for client in selected_clients])
     embeddings = np.array([embeddings_before[client] for client in selected_clients])
     delta = embeddings_ - embeddings
-
+    delta = delta.squeeze() 
     pca = PCA(n_components=n_components)
     delta_3d = pca.fit_transform(delta)
 

@@ -1,37 +1,38 @@
 name: Federated Learning poisoning attack testbed
 server:
   num-round: 30
-  clients: 1
-  mode: fedavg
+  clients: 3
+  mode: hyper
   hyper-detection:
     enable: False
     cosine-search: 10
     n_components: 3
-    eps: 0.015
+    eps: 0.007
     min_samples: 3
   model: TransformerModel
   data-name: ICU
   parameters:
-    load: True
+    load: False
   validation: True
   data-distribution:
     num-data-range:
-      - 5000
-      - 5000
+      - 12000
+      - 15000
   genuine-rate: 0.5
   random-seed: 1
 
 rabbit:
-  address: 127.0.0.1
-  username: admin
-  password: admin
+  address: 192.168.101.13
+  username: thuong 
+  password: thuong
 
 log_path: .
 
 learning:
-  epoch: 1
-  learning-rate: 0.001
+  epoch: 5
+  learning-rate: 0.004 # 0.004
   hyper-lr: 0.001
   momentum: 0.5
-  batch-size: 64
-  clip-grad-norm: 50.0
+  batch-size: 128
+  clip-grad-norm: 1.0
+  

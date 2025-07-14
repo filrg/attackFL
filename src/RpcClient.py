@@ -49,6 +49,7 @@ class RpcClient:
                 if body:
                     status = self.response_message(body)
                 time.sleep(0.5)
+                
             except AMQPConnectionError as e:
                 print(f"Connection failed, retrying in 5 seconds: {e}")
                 self.connect()
@@ -152,11 +153,12 @@ class RpcClient:
         clip_grad_norm = self.response["clip_grad_norm"]
 
         if data_name and not self.train_set:
-            if data_name == "ICU":
-                with gzip.open("data/train_dataset.pkl.gz", "rb") as f:
-                    self.train_set = pickle.load(f)
+            
             if data_name == "HAR":
                 with gzip.open("data/icu_har_train_ds.pkl.gz", "rb") as f:
+                    self.train_set = pickle.load(f)
+            if data_name == "ICU":
+                with gzip.open("train_dataset.pkl.gz", "rb") as f:
                     self.train_set = pickle.load(f)
             else:
                 raise ValueError(f"Data name '{data_name}' is not valid.")
