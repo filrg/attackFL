@@ -22,9 +22,9 @@ server:
   random-seed: 1
 
 rabbit:
-  address: 192.168.101.13
-  username: thuong 
-  password: thuong
+  address: 192.0.0.1
+  username: admin
+  password: admin
 
 log_path: .
 
